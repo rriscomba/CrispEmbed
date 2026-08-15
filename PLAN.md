@@ -4,6 +4,211 @@ Lightweight, dependency-free text/image/audio embedding inference via ggml.
 Same philosophy as CrispASR: pure C/C++, GGUF models, quantisation,
 GPU-ready via ggml backends (CUDA/Metal/Vulkan), no Python at runtime.
 
+## OPEN TASKS — OpenVINO backend (opened 2026-08-15, requested: make OpenVINO the default backend, piloted on PP-OCRv6 detector + RT-DETRv2 layout)
+
+**Status (updated same day, round 3): build wiring landed, gated OFF by default
+(`GGML_OPENVINO`). All ops the two pilot models call have OpenVINO translators,
+and — unlike what round 2 assumed — they ARE now numerically validated, op by
+op, against ggml's own CPU reference:**
+
+| op | test-backend-ops (`test -b OPENVINO0`) |
+|---|---|
+| CONV_2D | **1458/1458** |
+| CONV_2D_DW | **4/4** |
+| POOL_2D | **128/128** |
+| UPSCALE | **21/21** (incl. bicubic + antialias) |
+
+**Correction to round 2's stated blocker:** round 2 claimed there was "no
+OpenVINO-capable inference device" here. That was wrong — OpenVINO's **CPU
+plugin runs on any x86-64**, this box included (`OpenVINO: using device CPU`).
+What is actually blocked is only huggingface.co (org egress policy), i.e. the
+GGUF *weights*. Validating op translators never needed those weights: ggml
+ships `tests/test-backend-ops`, which builds synthetic graphs and diffs every
+registered backend against the CPU reference. That is the right acceptance
+harness for this layer of work and it was available all along.
+
+**A whole-model decoded-output roundtrip is still outstanding** (still needs HF
+access for the PP-OCRv6/RT-DETRv2 GGUFs) and remains the bar before any default
+flips — but the op layer is no longer unverified.
+
+### Round 3 findings — every one of these came from the harness, not inspection
+
+Running the tests immediately falsified several things round 2 had reasoned its
+way into. Recording them because the pattern (careful source-reading was not
+enough) is the lesson:
+
+1. **UPSCALE ignored ne2/ne3 entirely.** ggml's interpolate rescales channel
+   and batch too, with truncating index arithmetic, *regardless of scale mode*.
+   The translator only resized the spatial axes, so any case where ne2/ne3
+   changed produced a wrong-shaped output — reported by the harness as
+   `sentinel mismatch`, i.e. an **out-of-bounds write**, not a wrong number.
+   Fixed with a second NEAREST Interpolate over the remaining axes (legitimate
+   because the two index computations are separable).
+2. **Neither conv translator unified element types.** ggml allows an F16 kernel
+   against an F32 image (`ggml_conv_2d_direct`'s type assert is commented out);
+   OpenVINO requires one type across both operands. This alone was **785 of the
+   841 CONV_2D failures**.
+3. **`to_shape()` throws on dynamic shapes.** Hit for real by the perf harness.
+   `conv_2d_dw` no longer queries the shape at all (an `Unsqueeze` expresses the
+   depthwise filter reshape without it — simpler *and* dynamic-safe), `conv_2d`
+   makes its shape guard conditional, `upscale` reports NotImplemented cleanly.
+4. **Rejecting inside a translator is too late.** By the time the frontend runs,
+   the scheduler has already committed the node to this backend, so a
+   translate-time throw is a hard failure rather than a CPU fallback. The three
+   genuinely-unsupported sub-cases were therefore moved into
+   `ggml_backend_openvino_device_supports_op`: CWHN (channels-last) CONV_2D_DW,
+   CONV_2D with a dilated kernel larger than the padded input (ggml's C integer
+   division truncates toward zero and still declares a size-1 output; OV's shape
+   inference disagrees), and antialiased UPSCALE while *downscaling*.
+5. **The antialias mapping was wrong, but only when downscaling.** OV's
+   `antialias` attribute does not reproduce ggml's triangle filter. It is a
+   no-op at scale >= 1 (where ggml's support collapses to 1 pixel and both
+   reduce to plain bilinear — that case passes), so the guard is scoped to
+   downscaling rather than banning antialias outright.
+6. **POOL_2D's `exclude_pad=false` reasoning held.** 128/128 across every
+   kernel/stride/padding combination — the one round-2 inference that survived
+   contact with measurement.
+
+Not covered: the RELU/SIGMOID additions. `test-backend-ops` only carries f16
+variants for those, which the backend declines, so they report 0/0 — they remain
+unexercised here (they are 1:1 elementwise maps, but that is an argument, not a
+measurement).
+
+### Round 3 — efficiency, measured
+
+`perf` mode cannot benchmark these ops: it builds graphs with a dynamic
+dimension and OpenVINO's CPU plugin cannot compile a Convolution with dynamic
+weights at all. Measured instead with a static-shape harness at
+PP-OCRv6/RT-DETR-like sizes (`scratchpad/bench_ov_ops.cpp`, `bench_depth.cpp`).
+
+Single op, per `ggml_backend_graph_compute` call — OpenVINO loses everywhere:
+
+| case | CPU | OpenVINO | speedup |
+|---|---|---|---|
+| conv3x3 128×128×64→64 | 28.1 ms | 32.9 ms | 0.85× |
+| dwconv3x3 128×128×64 | 6.9 ms | 27.0 ms | 0.26× |
+| maxpool2×2 256×256×64 | 10.1 ms | 28.6 ms | 0.35× |
+| upscale ×2 64×64×128 | 0.76 ms | 28.6 ms | 0.03× |
+
+Every OpenVINO number lands near ~28 ms regardless of workload — including an
+upscale the CPU does in 0.76 ms. **That is a fixed per-compute cost (graph
+conversion), not compute.** Chaining conv layers into one graph separates the
+two:
+
+| conv layers | CPU | OpenVINO | speedup |
+|---|---|---|---|
+| 1 | 6.5 ms | 22.0 ms | 0.30× |
+| 4 | 31.5 ms | 31.2 ms | 1.01× (break-even) |
+| 8 | 55.5 ms | 37.1 ms | 1.50× |
+| 16 | 124.9 ms | 54.0 ms | 2.31× |
+| 17 | 123.9 ms | 47.3 ms | 2.63× |
+
+Fitting: OpenVINO ≈ 19.5 ms fixed + ~2.1 ms/layer; ggml CPU ≈ 7.4 ms/layer. So
+the **convolution kernel itself is roughly 3.4× faster**, and the fixed cost
+amortises from ~4 layers on. That is the efficiency answer: these translators
+are not the bottleneck, and OpenVINO is the right choice for whole-network
+graphs while being a bad choice per-op.
+
+### Round 4 — blocker RESOLVED, and a defect in round 3's own deliverable
+
+**The >17-layer failure is fixed.** Root cause, found by instrumenting rather
+than reasoning (round 3's two guesses about it were both wrong):
+
+`is_naive()` in `ggml/src/ggml-openvino/utils.cpp` has a literal
+`constexpr int naive_graph_size_threshold = 20`. Graphs under 20 ops take a
+"naive" path whose input shapes are plain and static. At 20 ops and above the
+graph goes down the **LLM path**, and there `is_kvcache()` decides what a KV
+cache is with:
+
+```c
+tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY
+```
+
+`USAGE_ANY` is the **default** buffer usage. It identifies the KV cache in a
+llama.cpp model only because there the weights live in a `USAGE_WEIGHTS`
+buffer. In a CNN graph — anything allocated through
+`ggml_backend_alloc_ctx_tensors` — *every* tensor has `USAGE_ANY`, so
+convolution **kernels** were classified as KV cache and
+`get_graph_input_shape()` forced their OV dim 2 dynamic. OpenVINO cannot
+compile a Convolution with dynamic weights at all, hence the hard failure.
+That is also why the threshold was exactly 17-vs-20: it was the `is_naive()`
+constant, nothing to do with graph depth per se.
+
+**Fix:** `is_kvcache()` now returns false when the consuming op is
+CONV_2D/CONV_2D_DW/POOL_2D/UPSCALE (`is_conv_like_op()`, `ggml-decoder.h`).
+
+The exclusion is keyed on the **consuming op, not the tensor shape**, on
+purpose. A shape-based rule (real KV caches being `[.., .., 1, 1]`) also fixes
+it and was tried first — but CrispEmbed's own VLM decoders allocate 3-D/4-D KV
+caches (`qwen2vl_ocr.cpp:1105`, `got_ocr.cpp:975`), so that rule would have
+reclassified them, and there is no way to test a VLM here. Keying on conv-like
+ops means **the only graphs whose behaviour changes are ones that could not run
+at all before**, so it cannot regress a working path. (Also ruled out: relaxing
+the naive threshold — `naive_compute()` recompiles the model on every call, no
+cache; and disabling dynamic dims for "non-LLM" graphs — `graph_key` is
+`(n_nodes, first_node_name, last_node_name)` with **no shapes**, so a cached
+model would be reused across changed shapes.)
+
+**Verified:**
+
+| conv layers | CPU | OpenVINO | speedup |
+|---|---|---|---|
+| 17 | 122 ms | 47 ms | 2.58x |
+| 20 | 146 ms | 52 ms | 2.82x |
+| 32 | 278 ms | 71 ms | 3.93x |
+| 48 | 416 ms | 91 ms | 4.59x |
+| 64 | 560 ms | 115 ms | **4.88x** |
+
+And a detector-shaped mixed stack (conv/relu/pool/upscale/sigmoid,
+`bench_openvino_cnn_stack.cpp`) at 10, 26 and 50 ops now runs and matches the
+CPU backend elementwise: `max|diff|` 5.96e-08, 5.96e-08, 0.0. That is the
+closest thing to a real-model check available without weights.
+
+No regression across the ops that share the touched code path: CONV_2D
+1458/1458, CONV_2D_DW 4/4, POOL_2D 128/128, UPSCALE 21/21, ROPE 92/92,
+SOFT_MAX 105/105, GET_ROWS 28/28, CPY 134/134, MUL_MAT 380/380.
+
+### ⚠ Correction: round 3 silently dropped RELU and SIGMOID
+
+Round 3's commit message claimed its patch "supersedes and folds in the earlier
+`ggml-openvino-unary-ops.patch`". **It did not.** The unary patch was generated,
+the working tree was reverted, and the conv/pool/upscale patch was then produced
+from a tree that no longer contained the RELU/SIGMOID lines — then the unary
+patch file was deleted. The loss was invisible because `test-backend-ops` only
+carries f16 cases for those ops, which the backend declines, so they report 0/0
+and nothing failed.
+
+It surfaced only when the mixed CNN stack above was run:
+`Translation for operation type GGML_UNARY_OP_RELU is not implemented`. Both
+pilot models use RELU and SIGMOID throughout, so the round-3 patch could never
+have run either of them. Restored in `op_table.cpp` and confirmed present in the
+regenerated patch, which is also verified to apply cleanly to a pristine
+submodule. Lesson: check what a regenerated patch actually contains instead of
+trusting the regeneration, and prefer an end-to-end graph over per-op tests to
+catch missing registrations.
+
+### Next actions (in order)
+
+1. Get onto a box with HF access, pull the PP-OCRv6 (`ppocrv6-*-det`) and
+   RT-DETRv2 (`layout-heron`) GGUFs, apply
+   `patches/ggml-openvino-conv-pool-upscale-ops.patch` to the `ggml` submodule
+   (or land it in `CrispStrobe/ggml`), and run the real decoded-output A/B with
+   `--gpu-backend openvino` against the CPU baseline on the canonical page
+   fixtures and the COFIDE form: region/box counts, IoU, confidence, timing.
+   Nothing known now blocks this — the op coverage is complete and the depth
+   blocker is gone — so this is the next real step.
+2. Expect the ~20 ms fixed graph-conversion cost per compute to be amortised
+   by a whole model (a real detector is far deeper than the 64 layers measured
+   at 4.88x), and expect single-op or few-op lanes to stay slower than the
+   existing backends. Route accordingly rather than switching everything.
+3. Worth checking during that A/B: `naive_compute()` recompiles on every call
+   with no caching, so any lane whose graph lands under `is_naive()`'s 20-op
+   threshold pays a full compile per inference. If a small OCR stage does that,
+   it is a cheap win to fix.
+4. Only after a measured whole-model A/B does "OpenVINO as default" become a
+   defensible question — and even then CUDA/Vulkan/Metal stay as working,
+   non-deleted fallback paths per the hard rule.
+
 ## HANDOVER — OCR round N+4 (written 2026-08-07, after the round-N+3-consumption session)
 
 **Read before doing anything:** this section; the ~7 DONE board rows below
