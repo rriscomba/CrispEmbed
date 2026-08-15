@@ -52,6 +52,16 @@ option(GGML_BLAS        "Enable BLAS acceleration (OpenBLAS/MKL)" OFF)
 option(GGML_CUDA        "Enable CUDA GPU acceleration" OFF)
 option(GGML_VULKAN      "Enable Vulkan GPU acceleration" OFF)
 option(GGML_METAL       "Enable Metal GPU acceleration (macOS)" OFF)
+# Intel OpenVINO backend (x86-64/arm64 CPU, iGPU, NPU). Vendored into the ggml
+# submodule from upstream llama.cpp (ggml-org/llama.cpp PR #15307). Requires an
+# external OpenVINO Runtime (find_package(OpenVINO)) and OpenCL dev headers —
+# neither ships with this repo, matching how GGML_CUDA needs the CUDA Toolkit.
+# Off by default like every other GPU backend: opt-in, coexists with
+# CUDA/Vulkan/Metal, selected at runtime via `--gpu-backend openvino` (see
+# src/core/gpu_backend_pref.h, which already does registry-name matching
+# generically and needed no OpenVINO-specific code). See PLAN.md for the
+# op-coverage A/B status before treating any model as validated on this path.
+option(GGML_OPENVINO    "Enable OpenVINO acceleration (Intel CPU/iGPU/NPU)" OFF)
 # ggml declares option(GGML_METAL_EMBED_LIBRARY ... ${GGML_METAL}): its default
 # follows GGML_METAL only at the FIRST configure of a build dir. A dir first
 # configured without Metal caches EMBED_LIBRARY=OFF, and a later

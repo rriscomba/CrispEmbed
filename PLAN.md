@@ -4,6 +4,112 @@ Lightweight, dependency-free text/image/audio embedding inference via ggml.
 Same philosophy as CrispASR: pure C/C++, GGUF models, quantisation,
 GPU-ready via ggml backends (CUDA/Metal/Vulkan), no Python at runtime.
 
+## OPEN TASKS — OpenVINO backend (opened 2026-08-15, requested: make OpenVINO the default backend, piloted on PP-OCRv6 detector + RT-DETRv2 layout)
+
+**Status: build wiring landed and gated OFF by default (`GGML_OPENVINO`, mirrors
+GGML_CUDA/VULKAN/METAL). Op-coverage is CONFIRMED insufficient for the requested
+pilot models — do not flip any default before the gaps below are closed and
+A/B'd. This is a measured finding, not a guess: verified by actually building
+`ggml-openvino` against a real OpenVINO 2026.3.0 runtime + OpenCL dev headers in
+this session.**
+
+### What's in the `ggml` submodule already
+
+The fork's `ggml` submodule (branch `sync/upstream-v0.17`, commit `890278a`)
+already vendors llama.cpp's upstream `ggml-openvino` backend
+(`ggml-org/llama.cpp` PR #15307, files under `ggml/src/ggml-openvino/`) and
+`ggml/CMakeLists.txt` already declares `option(GGML_OPENVINO ...)` and wires
+it via `ggml_add_backend(OPENVINO)`. Nobody had exposed it at the CrispEmbed
+top level yet — that's the only gap that existed at the build-plumbing layer.
+
+### What this session did
+
+1. Added `option(GGML_OPENVINO "Enable OpenVINO acceleration (Intel CPU/iGPU/NPU)" OFF)`
+   to the root `CMakeLists.txt`, same pattern as GGML_CUDA/VULKAN/METAL (off by
+   default, opt-in via `-DGGML_OPENVINO=ON`).
+2. Confirmed `src/core/gpu_backend_pref.h` (`--gpu-backend <name>`) needed **no**
+   OpenVINO-specific code — it matches ggml backend-registry names generically,
+   so `--gpu-backend openvino` already works once the backend is compiled in.
+3. Did a real build validation, not a paper one: installed the OpenVINO C++
+   runtime via the `openvino` pip wheel (2026.3.0, provides `OpenVINOConfig.cmake`
+   under `<site-packages>/openvino/cmake`) + `ocl-icd-opencl-dev`/`opencl-headers`
+   from apt, configured with `-DGGML_OPENVINO=ON -DCMAKE_PREFIX_PATH=<pip pkg>/cmake`,
+   and built the `ggml-openvino` target standalone. **It compiles and links
+   clean** against a real OpenVINO runtime — the vendored code isn't bit-rotted.
+4. Read `ggml/src/ggml-openvino/openvino/op_table.cpp` (the full translated-op
+   allowlist) and cross-referenced it against what `src/ppocrv6_det.cpp` and
+   `src/layout_detect.cpp` actually call.
+5. Added translators for `GGML_UNARY_OP_RELU` and `GGML_UNARY_OP_SIGMOID`
+   (`op_table.cpp`, using the existing `translate_1to1_match_1_input<v0::Relu>`
+   / `<v0::Sigmoid>` template already used for GELU/TANH — these are
+   standard 1:1 elementwise ops with no shape/attribute mapping, same risk
+   class as the ops already present). Rebuilt clean.
+
+### Confirmed gap: PP-OCRv6 detector + RT-DETRv2 layout will NOT translate today
+
+`op_table.cpp`'s `get_supported_ops()` covers attention/decoder-shaped graphs
+(ADD, MUL, MUL_MAT, IM2COL, ROPE, SOFT_MAX, FLASH_ATTN_EXT, …) — expected,
+since upstream built this for LLM decoders. Both requested pilot models are
+CNN/detection graphs and call ops that are **absent** from the table:
+
+- `src/layout_detect.cpp` (RT-DETRv2 layout, 17 classes): `ggml_conv_2d_direct`
+  (:488, → `GGML_OP_CONV_2D`, unsupported — note this is the *direct* conv op,
+  distinct from `ggml_conv_2d`'s IM2COL+MUL_MAT decomposition, which *would*
+  translate today), `ggml_pool_2d` (:573, :589 → `GGML_OP_POOL_2D`), plus
+  RELU/SIGMOID (now fixed by this session's addition).
+- `src/ppocrv6_det.cpp` (PP-OCRv6 text detector): `ggml_conv_2d_dw` (:462 →
+  `GGML_OP_CONV_2D_DW`, depthwise, unsupported), `ggml_conv_2d_direct` (:463),
+  `ggml_pool_2d` (:492, :558, :650, :675), `ggml_upscale` (:667, :689, :691,
+  :693 → `GGML_OP_UPSCALE`, used for the FPN-style decode head), plus
+  RELU/SIGMOID (now fixed).
+
+None of `GGML_OP_CONV_2D`, `GGML_OP_CONV_2D_DW`, `GGML_OP_POOL_2D`,
+`GGML_OP_UPSCALE` have translators in `op_table.cpp`. Per upstream's own docs
+(researched this session, see PR #15307 / `docs/backend/OPENVINO.md`), an
+unsupported op fails at **graph-translation time**, not silently — expect a
+`NotImplementedFailure`-class exception the first time either model's graph
+is handed to the OpenVINO backend, not a wrong-but-plausible output. That is
+actually the good failure mode: it can't silently corrupt OCR/layout output,
+it just won't run yet.
+
+### Why this session stopped here instead of writing those 4 translators
+
+CLAUDE.md's hard rule: **decoded-output roundtrip against ground truth is the
+only acceptance test**, and new op translators need exactly that before they
+can be trusted — conv/pool/upscale involve stride/padding/dilation and
+NCHW-vs-ggml-layout mapping, which is real op-authoring work with a wrong-answer
+failure mode (unlike RELU/SIGMOID, a mistranslated padding mode won't throw,
+it'll produce a plausible-looking wrong region grid or wrong glyph boxes).
+This sandbox has no OpenVINO-capable device to actually run inference on, no
+PP-OCRv6/RT-DETRv2 GGUF + test image fixture wired up here, and no comparator
+run yet — so writing those 4 translators now would mean shipping unverified
+numeric code on the riskiest op class in the whole set. Not done here.
+
+### Next actions (in order)
+
+1. Get this branch onto a box with a real OpenVINO-capable device (Intel
+   CPU is enough — OpenVINO's CPU plugin doesn't need iGPU/NPU) and the
+   existing page-comparator/benchmark tooling (`crispasr-crispembed-dev.md`
+   mandates the diff harness at every boundary).
+2. Write `GGML_OP_CONV_2D` and `GGML_OP_CONV_2D_DW` translators in
+   `ggml/src/ggml-openvino/openvino/op/` (new files, following the existing
+   op/ dir pattern — see `im2col.cpp` for the closest existing analogue),
+   mapping ggml's `[KW,KH,IC,OC]`/`[W,H,C,N]` layout + `op_params`
+   (stride/pad/dilation) to `ov::op::v1::Convolution` /
+   `ov::op::v1::GroupConvolution` attributes.
+3. Same for `GGML_OP_POOL_2D` (→ `ov::op::v1::{Avg,Max}Pool`, ggml's pool op
+   carries op type + kernel/stride/pad in `op_params`) and `GGML_OP_UPSCALE`
+   (→ `ov::op::v11::Interpolate`, check ggml's upscale mode — nearest vs
+   bilinear — against Interpolate's mode enum).
+4. Run PP-OCRv6 detector and RT-DETRv2 layout through the comparator with
+   `--gpu-backend openvino` vs the existing CPU/CUDA/Vulkan/Metal path on the
+   canonical page fixture(s): actual text/region/line counts, CER/WER,
+   confidence, timing — not pass/fail. Record the result here and in
+   `PERFORMANCE.md` even if it's worse or fails.
+5. Only after that A/B is measured and recorded does "OpenVINO as default"
+   become a defensible next question — and even then, CUDA/Vulkan/Metal stay
+   as working, non-deleted fallback paths per the hard rule.
+
 ## HANDOVER — OCR round N+4 (written 2026-08-07, after the round-N+3-consumption session)
 
 **Read before doing anything:** this section; the ~7 DONE board rows below
