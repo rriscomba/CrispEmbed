@@ -1,5 +1,59 @@
 # CrispEmbed Performance
 
+## OpenVINO backend: op-level correctness + conv throughput (x86-64 CPU plugin, 2026-08-15)
+
+OpenVINO 2026.3.0 (pip wheel, CPU plugin), `-DGGML_OPENVINO=ON`, Release.
+Correctness via ggml's own `tests/test-backend-ops test -b OPENVINO0`, which
+diffs the backend against the ggml CPU reference:
+
+| op | result |
+|---|---|
+| CONV_2D | 1458/1458 |
+| CONV_2D_DW | 4/4 |
+| POOL_2D | 128/128 |
+| UPSCALE | 21/21 (nearest, bilinear, bicubic, antialias, align_corners) |
+
+Counts exclude sub-cases the backend now declines in `supports_op` (CWHN
+depthwise, degenerate dilation geometry, antialiased downscale); those fall back
+to CPU by design rather than failing.
+
+**Timing — the fixed per-compute conversion cost dominates single ops.** ggml's
+`perf` mode cannot measure these (it emits dynamic-shaped weights, which the
+OpenVINO CPU plugin refuses for Convolution), so these are static-shape
+measurements at OCR-like sizes:
+
+| single op | CPU | OpenVINO | speedup |
+|---|---|---|---|
+| conv3x3 128x128x64 -> 64 | 28.1 ms | 32.9 ms | 0.85x |
+| conv3x3 64x64x128 -> 128 | 19.7 ms | 28.4 ms | 0.69x |
+| conv1x1 128x128x64 -> 256 | 27.2 ms | 37.2 ms | 0.73x |
+| conv3x3/s2 256x256x32 -> 64 | 24.5 ms | 31.7 ms | 0.77x |
+| dwconv3x3 128x128x64 | 6.9 ms | 27.0 ms | 0.26x |
+| maxpool2x2 256x256x64 | 10.1 ms | 28.6 ms | 0.35x |
+| upscale x2 64x64x128 | 0.76 ms | 28.6 ms | 0.03x |
+
+Every OpenVINO figure sits near ~28 ms whatever the workload, so that is fixed
+cost, not compute. Chaining conv layers into one graph separates them:
+
+| conv layers in one graph | CPU | OpenVINO | speedup |
+|---|---|---|---|
+| 1 | 6.5 ms | 22.0 ms | 0.30x |
+| 2 | 14.1 ms | 26.0 ms | 0.54x |
+| 4 | 31.5 ms | 31.2 ms | 1.01x |
+| 8 | 55.5 ms | 37.1 ms | 1.50x |
+| 16 | 124.9 ms | 54.0 ms | 2.31x |
+| 17 | 123.9 ms | 47.3 ms | 2.63x |
+
+Fit: OpenVINO ~19.5 ms fixed + ~2.1 ms/layer; ggml CPU ~7.4 ms/layer, i.e. the
+convolution itself is ~3.4x faster and the fixed cost amortises from ~4 layers.
+Practical rule: route whole-network graphs to OpenVINO, never single-op lanes.
+
+**Caveat, not yet resolved:** graphs deeper than 17 conv layers fail to compile
+(`Doesn't support dynamic weights shape`); verified OK at 17, failing from 20.
+Cause is the upstream decoder marking graph inputs dynamic once the model is
+split, not the op translators. Real OCR/layout backbones are deeper than this,
+so no whole-model number can be quoted yet. See PLAN.md.
+
 ## Issue #45 follow-up: the "0 = auto" n_threads contract implemented API-wide; server default fixed (M1, 2026-08-09)
 
 Auditing the non-CLI surfaces for the issue-#45 defect class found a second,

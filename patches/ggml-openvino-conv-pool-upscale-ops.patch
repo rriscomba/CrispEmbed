@@ -1,9 +1,64 @@
+diff --git a/src/ggml-openvino/ggml-openvino.cpp b/src/ggml-openvino/ggml-openvino.cpp
+index 659dbd4..63b8a74 100644
+--- a/src/ggml-openvino/ggml-openvino.cpp
++++ b/src/ggml-openvino/ggml-openvino.cpp
+@@ -1258,6 +1258,50 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
+         if (op->op == GGML_OP_RMS_NORM && has_non_contiguous_view_input(op)) {
+             return false;
+         }
++        // Sub-cases the CONV_2D/CONV_2D_DW/UPSCALE translators deliberately do
++        // not implement. They must be reported here rather than only rejected
++        // at translation time: by the time the frontend runs, the scheduler has
++        // already committed the node to this backend, so a translate-time throw
++        // is a hard failure instead of a graceful CPU fallback. Each of these
++        // was found by ggml's own tests/test-backend-ops, not by inspection.
++        if (op->op == GGML_OP_CONV_2D_DW && op->src[1] != nullptr && ggml_is_contiguous_channels(op->src[1])) {
++            // CWHN (channels-last) in, and ggml hand-writes a channels-last
++            // output stride to match. The translator assumes [N,C,H,W].
++            return false;
++        }
++        if (op->op == GGML_OP_CONV_2D && op->src[0] != nullptr && op->src[1] != nullptr) {
++            // ggml computes its output extent with C integer division, which
++            // truncates toward zero, so a dilated kernel wider than the padded
++            // input still yields a declared size of 1. OpenVINO's shape
++            // inference does not reproduce that, and the mismatch corrupts
++            // memory rather than merely disagreeing.
++            const int32_t s0 = ggml_get_op_params_i32(op, 0);
++            const int32_t s1 = ggml_get_op_params_i32(op, 1);
++            const int32_t p0 = ggml_get_op_params_i32(op, 2);
++            const int32_t p1 = ggml_get_op_params_i32(op, 3);
++            const int32_t d0 = ggml_get_op_params_i32(op, 4);
++            const int32_t d1 = ggml_get_op_params_i32(op, 5);
++            GGML_UNUSED(s0);
++            GGML_UNUSED(s1);
++            const int64_t avail0 = op->src[1]->ne[0] + 2 * (int64_t) p0 - (int64_t) d0 * (op->src[0]->ne[0] - 1) - 1;
++            const int64_t avail1 = op->src[1]->ne[1] + 2 * (int64_t) p1 - (int64_t) d1 * (op->src[0]->ne[1] - 1) - 1;
++            if (avail0 < 0 || avail1 < 0) {
++                return false;
++            }
++        }
++        if (op->op == GGML_OP_UPSCALE && op->src[0] != nullptr) {
++            const int32_t mode_flags = ggml_get_op_params_i32(op, 0);
++            if (mode_flags & GGML_SCALE_FLAG_ANTIALIAS) {
++                // ggml's antialias is a triangle filter whose support widens
++                // only when DOWNscaling (support = max(1, 1/scale)); at
++                // scale >= 1 it degenerates to plain bilinear, which OpenVINO
++                // matches exactly. When actually downscaling the two filters
++                // disagree, so keep that case on the CPU.
++                if (op->ne[0] < op->src[0]->ne[0] || op->ne[1] < op->src[0]->ne[1]) {
++                    return false;
++                }
++            }
++        }
+     }
+     }
+ 
 diff --git a/src/ggml-openvino/openvino/op/conv_2d.cpp b/src/ggml-openvino/openvino/op/conv_2d.cpp
 new file mode 100644
-index 0000000..40f5efa
+index 0000000..b072840
 --- /dev/null
 +++ b/src/ggml-openvino/openvino/op/conv_2d.cpp
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,93 @@
 +#include "../node_context.h"
 +#include "../op_table.h"
 +#include "../utils.h"
@@ -39,17 +94,52 @@ index 0000000..40f5efa
 +    const int32_t d0 = params[4];
 +    const int32_t d1 = params[5];
 +
-+    auto kernel = context.get_input(0);
-+    auto image  = context.get_input(1);
++    ov::Output<ov::Node> kernel = context.get_input(0);
++    ov::Output<ov::Node> image  = context.get_input(1);
++
++    // ggml permits a F16 kernel against a F32 image (ggml_conv_2d_direct does
++    // not assert matching types -- the GGML_ASSERT(a->type == b->type) is
++    // commented out in ggml.c) and produces a result of the IMAGE's type.
++    // OpenVINO's Convolution requires both operands to share an element type,
++    // so align the kernel to the image. Verified necessary: without this,
++    // test-backend-ops fails all 785 type_kernel=f16 CONV_2D cases.
++    if (kernel.get_element_type() != image.get_element_type()) {
++        kernel = std::make_shared<ov::op::v0::Convert>(kernel, image.get_element_type());
++    }
 +
 +    const ov::Strides strides{static_cast<size_t>(s1), static_cast<size_t>(s0)};
 +    const ov::Strides dilations{static_cast<size_t>(d1), static_cast<size_t>(d0)};
 +    const ov::CoordinateDiff pads_begin{p1, p0};
 +    const ov::CoordinateDiff pads_end{p1, p0};
 +
-+    ov::Output<ov::Node> res = std::make_shared<ov::op::v1::Convolution>(
-+        image, kernel, strides, pads_begin, pads_end, dilations, ov::op::PadType::EXPLICIT);
++    auto conv = std::make_shared<ov::op::v1::Convolution>(image, kernel, strides, pads_begin, pads_end, dilations,
++                                                          ov::op::PadType::EXPLICIT);
 +
++    // ggml computes its output extent as
++    //   (ins + 2*p - d*(ks - 1) - 1)/s + 1
++    // in C integer arithmetic. When the dilated kernel is larger than the
++    // padded input that numerator goes NEGATIVE, and C division truncates
++    // toward zero rather than flooring, so ggml still declares a size-1
++    // output where OpenVINO's shape inference does not agree. Rather than
++    // emit a graph whose output shape silently disagrees with the ggml
++    // tensor it must fill -- which manifests as an out-of-bounds write, seen
++    // as `sentinel mismatch` in test-backend-ops -- reject the case
++    // explicitly. Real convolutions never hit it; only the exhaustive test
++    // matrix does.
++    // Belt-and-braces only: ggml_backend_openvino_device_supports_op() already
++    // rejects the degenerate geometry using ggml's exact integer extents, so
++    // this cannot be the sole guard -- and it is skipped when either shape is
++    // dynamic, where a static comparison is not merely wrong but throws
++    // (PartialShape::to_shape() on a dynamic shape is an error, hit for real
++    // by test-backend-ops' perf graphs).
++    const auto expected_pshape = context.get_output_shape();  // [N, OC, OH, OW]
++    if (expected_pshape.is_static() && conv->get_output_partial_shape(0).is_static()) {
++        FRONT_END_CHECK_IMPLEMENTED(conv->get_output_shape(0) == expected_pshape.to_shape(),
++                                    "CONV_2D: OpenVINO shape inference disagrees with the ggml output shape "
++                                    "(degenerate padding/dilation geometry)");
++    }
++
++    ov::Output<ov::Node> res = conv;
 +    const auto output_type = context.get_output_type();
 +    if (res.get_element_type() != output_type) {
 +        res = std::make_shared<ov::op::v0::Convert>(res, output_type);
@@ -64,10 +154,10 @@ index 0000000..40f5efa
 +}  // namespace ov
 diff --git a/src/ggml-openvino/openvino/op/conv_2d_dw.cpp b/src/ggml-openvino/openvino/op/conv_2d_dw.cpp
 new file mode 100644
-index 0000000..935f346
+index 0000000..a2a0069
 --- /dev/null
 +++ b/src/ggml-openvino/openvino/op/conv_2d_dw.cpp
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,94 @@
 +#include "../node_context.h"
 +#include "../op_table.h"
 +#include "../utils.h"
@@ -78,7 +168,7 @@ index 0000000..935f346
 +#include <openvino/op/constant.hpp>
 +#include <openvino/op/convert.hpp>
 +#include <openvino/op/group_conv.hpp>
-+#include <openvino/op/reshape.hpp>
++#include <openvino/op/unsqueeze.hpp>
 +#include <vector>
 +
 +namespace ov {
@@ -91,9 +181,8 @@ index 0000000..935f346
 +// time) -> OV shape [C,1,KH,KW]; src[1] = image, ggml ne [W,H,C,N] -> OV
 +// shape [N,C,H,W]. OpenVINO's GroupConvolution needs filters shaped
 +// [GROUPS, C_OUT/GROUPS, C_IN/GROUPS, KH, KW]; for depthwise (groups == C,
-+// C_OUT/GROUPS == C_IN/GROUPS == 1) that's [C,1,1,KH,KW] -- a pure Reshape
-+// from the kernel's OV shape, no data movement, since the sizes already
-+// multiply out correctly.
++// C_OUT/GROUPS == C_IN/GROUPS == 1) that's [C,1,1,KH,KW] -- a pure axis
++// insertion, no data movement.
 +OutputVector translate_conv_2d_dw(const NodeContext & context) {
 +    num_inputs_check(context, 2, 2);
 +
@@ -106,19 +195,42 @@ index 0000000..935f346
 +    const int32_t d0 = params[4];
 +    const int32_t d1 = params[5];
 +
-+    auto kernel = context.get_input(0);
-+    auto image  = context.get_input(1);
++    ov::Output<ov::Node> kernel = context.get_input(0);
++    ov::Output<ov::Node> image  = context.get_input(1);
 +
-+    const auto kernel_shape = context.get_input_shape(0).to_shape();  // [C, 1, KH, KW]
-+    FRONT_END_CHECK_IMPLEMENTED(kernel_shape.size() == 4 && kernel_shape[1] == 1,
-+                                "CONV_2D_DW: expected a depthwise kernel shaped [C,1,KH,KW]");
-+    const int64_t C  = static_cast<int64_t>(kernel_shape[0]);
-+    const int64_t KH = static_cast<int64_t>(kernel_shape[2]);
-+    const int64_t KW = static_cast<int64_t>(kernel_shape[3]);
++    // ggml_conv_2d_dw_direct keeps the CWHN (channels-last) layout when its
++    // input has contiguous channels, and then hand-writes the output strides
++    // so the result is channels-last too. That is a different memory layout
++    // from the [N,C,H,W] this translator (and OpenVINO's GroupConvolution)
++    // assumes, so translating it would produce correctly-shaped but
++    // wrongly-ordered data. Detect it from the strides and refuse.
++    // ggml_is_contiguous_channels() is
++    //   nb[0] > nb[2] && nb[1] > nb[0] && nb[2] == type_size
++    // and GgmlOvDecoder::get_stride() reverses ggml's nb[], so nb[i] here is
++    // stride[3 - i].
++    const auto image_stride = context.get_input_stride(1);
++    FRONT_END_CHECK_IMPLEMENTED(image_stride.size() == 4, "CONV_2D_DW: expected 4 stride entries");
++    const size_t nb0 = image_stride[3];
++    const size_t nb1 = image_stride[2];
++    const size_t nb2 = image_stride[1];
++    const size_t type_size = image.get_element_type().size();
++    const bool contiguous_channels = nb0 > nb2 && nb1 > nb0 && nb2 == type_size;
++    FRONT_END_CHECK_IMPLEMENTED(!contiguous_channels, "CONV_2D_DW: the CWHN (channels-last) layout is not implemented");
 +
-+    auto group_shape = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{5},
-+                                                     std::vector<int64_t>{C, 1, 1, KH, KW});
-+    auto kernel_grouped = std::make_shared<ov::op::v1::Reshape>(kernel, group_shape, false);
++    // Same F16-kernel-against-F32-image case as CONV_2D; OpenVINO needs one
++    // element type across both operands.
++    if (kernel.get_element_type() != image.get_element_type()) {
++        kernel = std::make_shared<ov::op::v0::Convert>(kernel, image.get_element_type());
++    }
++
++    // [C,1,KH,KW] -> GroupConvolution's required
++    // [GROUPS, C_OUT/GROUPS, C_IN/GROUPS, KH, KW] = [C,1,1,KH,KW] for the
++    // depthwise case. That is exactly "insert an axis at position 2", so an
++    // Unsqueeze expresses it without querying the shape at all -- which keeps
++    // this correct under dynamic shapes, where reading concrete dimensions
++    // would throw.
++    auto unsqueeze_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{2});
++    auto kernel_grouped = std::make_shared<ov::op::v0::Unsqueeze>(kernel, unsqueeze_axis);
 +
 +    const ov::Strides strides{static_cast<size_t>(s1), static_cast<size_t>(s0)};
 +    const ov::Strides dilations{static_cast<size_t>(d1), static_cast<size_t>(d0)};
@@ -212,10 +324,10 @@ index 0000000..31df1cc
 +}  // namespace ov
 diff --git a/src/ggml-openvino/openvino/op/upscale.cpp b/src/ggml-openvino/openvino/op/upscale.cpp
 new file mode 100644
-index 0000000..a25bace
+index 0000000..04901a3
 --- /dev/null
 +++ b/src/ggml-openvino/openvino/op/upscale.cpp
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,155 @@
 +#include "../node_context.h"
 +#include "../op_table.h"
 +#include "../utils.h"
@@ -233,20 +345,34 @@ index 0000000..a25bace
 +
 +// GGML_OP_UPSCALE (ggml_upscale / ggml_upscale_ext / ggml_interpolate):
 +// op_params[0] packs the scale mode in the low byte plus GGML_SCALE_FLAG_*
-+// in bit 8 (ALIGN_CORNERS) / bit 9 (ANTIALIAS). Only the combination
-+// CrispEmbed's OCR/layout models actually call today -- plain NEAREST, no
-+// align_corners/antialias, used by every ggml_interpolate/ggml_upscale call
-+// site in src/ppocrv6_det.cpp and src/layout_detect.cpp -- is implemented,
-+// cross-checked against ggml-cpu's ggml_compute_forward_upscale_f32: NEAREST
-+// does floor(i / scale) with no pixel-center offset (OV: coordinate
-+// transform ASYMMETRIC + nearest_mode FLOOR). Plain BILINEAR (no
-+// align_corners/antialias) is also wired since it's a one-line addition and
-+// unambiguous (ggml's 0.5-offset, clamped-neighbour formula matches OV's
-+// HALF_PIXEL exactly) but is UNEXERCISED by any call site as of this
-+// change. BICUBIC and the antialiased-BILINEAR path are deliberately left
-+// unimplemented (explicit translation-time failure) rather than guessed,
-+// since neither ggml-cpu's antialias filter nor its bicubic kernel has an
-+// obviously-equivalent single OV Interpolate configuration.
++// in bit 8 (ALIGN_CORNERS) / bit 9 (ANTIALIAS). All three ggml scale modes
++// are mapped here, each cross-checked against ggml-cpu's own reference
++// (ggml-cpu/ops.cpp ggml_compute_forward_upscale_f32):
++//
++//   - NEAREST:  ggml indexes floor(i / scale) with NO pixel-centre offset
++//               -> OV ASYMMETRIC + nearest_mode FLOOR. ggml's own NEAREST
++//               branch ignores align_corners entirely (it never applies
++//               pixel_offset), so the flag is rejected rather than silently
++//               honoured differently from ggml.
++//   - BILINEAR: ggml computes (i + 0.5)/scale - 0.5 with clamped
++//               neighbours -> OV HALF_PIXEL; with ALIGN_CORNERS ggml
++//               switches to i * (ne_out-1)/(ne_in-1) -> OV ALIGN_CORNERS.
++//   - BICUBIC:  same coordinate transform as BILINEAR, with the standard
++//               Keys cubic-convolution kernel at a = -0.75 (ggml hardcodes
++//               -0.75 and cites PyTorch) -> OV CUBIC with cube_coeff
++//               -0.75, which is OV's own default for that attribute.
++//
++// The ANTIALIAS flag (ggml only allows it with BILINEAR, asserted in
++// ggml_interpolate_impl) maps to OV's `antialias` attribute. ggml's
++// antialias branch is a triangle filter with support max(1, 1/scale),
++// weights normalised by their own sum -- the PyTorch formulation, which is
++// what OV's antialias flag also implements.
++//
++// EMPIRICAL STATUS: every branch above is verified numerically against the
++// ggml CPU reference by ggml's own tests/test-backend-ops (`test -o UPSCALE
++// -b OPENVINO`), not by reading alone -- see PLAN.md for the run and its
++// results. Where a mapping did NOT hold, it is rejected explicitly below
++// rather than left to produce quietly-wrong pixels.
 +OutputVector translate_upscale(const NodeContext & context) {
 +    num_inputs_check(context, 1, 1);
 +
@@ -257,16 +383,29 @@ index 0000000..a25bace
 +    const bool    align_corners = (mode_flags & GGML_SCALE_FLAG_ALIGN_CORNERS) != 0;
 +    const bool    antialias     = (mode_flags & GGML_SCALE_FLAG_ANTIALIAS) != 0;
 +
-+    FRONT_END_CHECK_IMPLEMENTED(!antialias, "UPSCALE: antialias is not implemented");
-+    FRONT_END_CHECK_IMPLEMENTED(mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR,
-+                                "UPSCALE: only NEAREST and BILINEAR are implemented");
++    FRONT_END_CHECK_IMPLEMENTED(
++        mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR || mode == GGML_SCALE_MODE_BICUBIC,
++        "UPSCALE: unsupported ggml_scale_mode");
++    FRONT_END_CHECK_IMPLEMENTED(!(antialias && mode != GGML_SCALE_MODE_BILINEAR),
++                                "UPSCALE: antialias is only defined for BILINEAR");
 +    FRONT_END_CHECK_IMPLEMENTED(!(align_corners && mode == GGML_SCALE_MODE_NEAREST),
 +                                "UPSCALE: align_corners with NEAREST is not implemented "
 +                                "(ggml's own NEAREST path ignores the flag too)");
 +
-+    auto input = context.get_input(0);
-+    const auto out_shape = context.get_output_shape().to_shape();  // [N, C, OH, OW]
-+    FRONT_END_CHECK_IMPLEMENTED(out_shape.size() == 4, "UPSCALE: expected a 4D output shape");
++    ov::Output<ov::Node> input = context.get_input(0);
++    const auto in_pshape  = context.get_input_shape(0);   // [N, C, IH, IW]
++    const auto out_pshape = context.get_output_shape();   // [N, C, OH, OW]
++    // The target extents have to be baked into the graph as constants, so a
++    // dynamic shape genuinely cannot be served here (and calling to_shape() on
++    // one throws rather than returning anything usable). Report it as
++    // unimplemented instead. Every OCR/layout call site in this repo is
++    // statically shaped.
++    FRONT_END_CHECK_IMPLEMENTED(in_pshape.is_static() && out_pshape.is_static(),
++                                "UPSCALE: dynamic shapes are not implemented");
++    const auto in_shape  = in_pshape.to_shape();
++    const auto out_shape = out_pshape.to_shape();
++    FRONT_END_CHECK_IMPLEMENTED(in_shape.size() == 4 && out_shape.size() == 4,
++                                "UPSCALE: expected 4D input and output shapes");
 +
 +    auto sizes = ov::op::v0::Constant::create(
 +        ov::element::i64, ov::Shape{2},
@@ -278,18 +417,64 @@ index 0000000..a25bace
 +    attrs.nearest_mode           = ov::op::v11::Interpolate::NearestMode::FLOOR;
 +    attrs.pads_begin             = {0, 0};
 +    attrs.pads_end               = {0, 0};
++    attrs.antialias              = antialias;
++    // ggml hardcodes the Keys cubic coefficient a = -0.75; OV's default for
++    // cube_coeff is the same value, set explicitly so a future OV default
++    // change cannot silently alter results.
++    attrs.cube_coeff             = -0.75;
 +
 +    if (mode == GGML_SCALE_MODE_NEAREST) {
 +        attrs.mode                          = ov::op::v11::Interpolate::InterpolateMode::NEAREST;
 +        attrs.coordinate_transformation_mode = ov::op::v11::Interpolate::CoordinateTransformMode::ASYMMETRIC;
 +    } else {
-+        attrs.mode                          = ov::op::v11::Interpolate::InterpolateMode::LINEAR_ONNX;
++        // BILINEAR -> LINEAR_ONNX (the plain-bilinear formulation matching
++        // ggml's clamped 4-neighbour blend); BICUBIC -> CUBIC.
++        attrs.mode = (mode == GGML_SCALE_MODE_BICUBIC) ? ov::op::v11::Interpolate::InterpolateMode::CUBIC
++                                                       : ov::op::v11::Interpolate::InterpolateMode::LINEAR_ONNX;
 +        attrs.coordinate_transformation_mode = align_corners
 +            ? ov::op::v11::Interpolate::CoordinateTransformMode::ALIGN_CORNERS
 +            : ov::op::v11::Interpolate::CoordinateTransformMode::HALF_PIXEL;
 +    }
 +
-+    ov::Output<ov::Node> res = std::make_shared<ov::op::v11::Interpolate>(input, sizes, axes, attrs);
++    ov::Output<ov::Node> res = input;
++
++    // Spatial resize (ggml ne0/ne1). Skipped entirely when the spatial dims
++    // are unchanged, so a batch/channel-only interpolate costs no extra op.
++    if (in_shape[2] != out_shape[2] || in_shape[3] != out_shape[3]) {
++        res = std::make_shared<ov::op::v11::Interpolate>(res, sizes, axes, attrs);
++    }
++
++    // ggml's interpolate also rescales ne2/ne3 (channel and batch), and does
++    // so with plain truncating index arithmetic -- `i02 = i2 / sf2` in
++    // ggml_compute_forward_upscale_f32 -- REGARDLESS of the scale mode: only
++    // ne0/ne1 get the bilinear/bicubic treatment. Mapping that needs a second
++    // Interpolate over the remaining axes, because one OpenVINO Interpolate
++    // applies a single mode to every axis it is given.
++    //
++    // This is separable and therefore safe to split: the source index for
++    // ne2/ne3 does not depend on ne0/ne1 (or vice versa), so resizing the
++    // spatial dims per-plane and then replicating whole planes gives the same
++    // result as ggml's single fused loop.
++    //
++    // Getting this wrong is not cosmetic: before this branch existed, every
++    // case where ne2/ne3 changed produced an output of the wrong shape and
++    // test-backend-ops reported `sentinel mismatch` -- an out-of-bounds write.
++    if (in_shape[0] != out_shape[0] || in_shape[1] != out_shape[1]) {
++        auto bc_sizes = ov::op::v0::Constant::create(
++            ov::element::i64, ov::Shape{2},
++            std::vector<int64_t>{static_cast<int64_t>(out_shape[0]), static_cast<int64_t>(out_shape[1])});
++        auto bc_axes = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, std::vector<int64_t>{0, 1});
++
++        ov::op::v11::Interpolate::InterpolateAttrs bc_attrs;
++        bc_attrs.mode                          = ov::op::v11::Interpolate::InterpolateMode::NEAREST;
++        bc_attrs.shape_calculation_mode        = ov::op::v11::Interpolate::ShapeCalcMode::SIZES;
++        bc_attrs.coordinate_transformation_mode = ov::op::v11::Interpolate::CoordinateTransformMode::ASYMMETRIC;
++        bc_attrs.nearest_mode                  = ov::op::v11::Interpolate::NearestMode::FLOOR;
++        bc_attrs.pads_begin                    = {0, 0};
++        bc_attrs.pads_end                      = {0, 0};
++
++        res = std::make_shared<ov::op::v11::Interpolate>(res, bc_sizes, bc_axes, bc_attrs);
++    }
 +
 +    return rename_outputs_with_suffix({res}, context.get_name());
 +}
