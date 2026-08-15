@@ -1,0 +1,330 @@
+diff --git a/src/ggml-openvino/openvino/op/conv_2d.cpp b/src/ggml-openvino/openvino/op/conv_2d.cpp
+new file mode 100644
+index 0000000..40f5efa
+--- /dev/null
++++ b/src/ggml-openvino/openvino/op/conv_2d.cpp
+@@ -0,0 +1,58 @@
++#include "../node_context.h"
++#include "../op_table.h"
++#include "../utils.h"
++
++#include <memory>
++#include <openvino/core/coordinate_diff.hpp>
++#include <openvino/core/strides.hpp>
++#include <openvino/op/convert.hpp>
++#include <openvino/op/convolution.hpp>
++
++namespace ov {
++namespace frontend {
++namespace ggml {
++namespace op {
++
++// GGML_OP_CONV_2D (ggml_conv_2d_direct): src[0] = kernel, ggml ne [KW,KH,IC,OC]
++// -> OV shape [OC,IC,KH,KW]; src[1] = image, ggml ne [W,H,IC,N] -> OV shape
++// [N,IC,H,W] (same "OV shape = reverse(ggml ne)" convention documented in
++// im2col.cpp). Both orderings already match OpenVINO's native Convolution
++// layout (NCHW data, [C_OUT,C_IN,KH,KW] filters) with no permutation needed,
++// and the resulting OV output [N,OC,OH,OW] reversed is ggml's declared
++// ne=[OW,OH,OC,N] for this op -- so this is a direct 1:1 op mapping, not a
++// hand-rederived one.
++OutputVector translate_conv_2d(const NodeContext & context) {
++    num_inputs_check(context, 2, 2);
++
++    const int32_t * params = context.get_output_op_params();
++    FRONT_END_CHECK_IMPLEMENTED(params != nullptr, "CONV_2D requires output op params");
++    const int32_t s0 = params[0];
++    const int32_t s1 = params[1];
++    const int32_t p0 = params[2];
++    const int32_t p1 = params[3];
++    const int32_t d0 = params[4];
++    const int32_t d1 = params[5];
++
++    auto kernel = context.get_input(0);
++    auto image  = context.get_input(1);
++
++    const ov::Strides strides{static_cast<size_t>(s1), static_cast<size_t>(s0)};
++    const ov::Strides dilations{static_cast<size_t>(d1), static_cast<size_t>(d0)};
++    const ov::CoordinateDiff pads_begin{p1, p0};
++    const ov::CoordinateDiff pads_end{p1, p0};
++
++    ov::Output<ov::Node> res = std::make_shared<ov::op::v1::Convolution>(
++        image, kernel, strides, pads_begin, pads_end, dilations, ov::op::PadType::EXPLICIT);
++
++    const auto output_type = context.get_output_type();
++    if (res.get_element_type() != output_type) {
++        res = std::make_shared<ov::op::v0::Convert>(res, output_type);
++    }
++
++    return rename_outputs_with_suffix({res}, context.get_name());
++}
++
++}  // namespace op
++}  // namespace ggml
++}  // namespace frontend
++}  // namespace ov
+diff --git a/src/ggml-openvino/openvino/op/conv_2d_dw.cpp b/src/ggml-openvino/openvino/op/conv_2d_dw.cpp
+new file mode 100644
+index 0000000..935f346
+--- /dev/null
++++ b/src/ggml-openvino/openvino/op/conv_2d_dw.cpp
+@@ -0,0 +1,72 @@
++#include "../node_context.h"
++#include "../op_table.h"
++#include "../utils.h"
++
++#include <memory>
++#include <openvino/core/coordinate_diff.hpp>
++#include <openvino/core/strides.hpp>
++#include <openvino/op/constant.hpp>
++#include <openvino/op/convert.hpp>
++#include <openvino/op/group_conv.hpp>
++#include <openvino/op/reshape.hpp>
++#include <vector>
++
++namespace ov {
++namespace frontend {
++namespace ggml {
++namespace op {
++
++// GGML_OP_CONV_2D_DW (ggml_conv_2d_dw_direct): src[0] = per-channel kernel,
++// ggml ne [KW,KH,1,C] (a->ne[2]==1 is asserted at ggml graph-construction
++// time) -> OV shape [C,1,KH,KW]; src[1] = image, ggml ne [W,H,C,N] -> OV
++// shape [N,C,H,W]. OpenVINO's GroupConvolution needs filters shaped
++// [GROUPS, C_OUT/GROUPS, C_IN/GROUPS, KH, KW]; for depthwise (groups == C,
++// C_OUT/GROUPS == C_IN/GROUPS == 1) that's [C,1,1,KH,KW] -- a pure Reshape
++// from the kernel's OV shape, no data movement, since the sizes already
++// multiply out correctly.
++OutputVector translate_conv_2d_dw(const NodeContext & context) {
++    num_inputs_check(context, 2, 2);
++
++    const int32_t * params = context.get_output_op_params();
++    FRONT_END_CHECK_IMPLEMENTED(params != nullptr, "CONV_2D_DW requires output op params");
++    const int32_t s0 = params[0];
++    const int32_t s1 = params[1];
++    const int32_t p0 = params[2];
++    const int32_t p1 = params[3];
++    const int32_t d0 = params[4];
++    const int32_t d1 = params[5];
++
++    auto kernel = context.get_input(0);
++    auto image  = context.get_input(1);
++
++    const auto kernel_shape = context.get_input_shape(0).to_shape();  // [C, 1, KH, KW]
++    FRONT_END_CHECK_IMPLEMENTED(kernel_shape.size() == 4 && kernel_shape[1] == 1,
++                                "CONV_2D_DW: expected a depthwise kernel shaped [C,1,KH,KW]");
++    const int64_t C  = static_cast<int64_t>(kernel_shape[0]);
++    const int64_t KH = static_cast<int64_t>(kernel_shape[2]);
++    const int64_t KW = static_cast<int64_t>(kernel_shape[3]);
++
++    auto group_shape = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{5},
++                                                     std::vector<int64_t>{C, 1, 1, KH, KW});
++    auto kernel_grouped = std::make_shared<ov::op::v1::Reshape>(kernel, group_shape, false);
++
++    const ov::Strides strides{static_cast<size_t>(s1), static_cast<size_t>(s0)};
++    const ov::Strides dilations{static_cast<size_t>(d1), static_cast<size_t>(d0)};
++    const ov::CoordinateDiff pads_begin{p1, p0};
++    const ov::CoordinateDiff pads_end{p1, p0};
++
++    ov::Output<ov::Node> res = std::make_shared<ov::op::v1::GroupConvolution>(
++        image, kernel_grouped, strides, pads_begin, pads_end, dilations, ov::op::PadType::EXPLICIT);
++
++    const auto output_type = context.get_output_type();
++    if (res.get_element_type() != output_type) {
++        res = std::make_shared<ov::op::v0::Convert>(res, output_type);
++    }
++
++    return rename_outputs_with_suffix({res}, context.get_name());
++}
++
++}  // namespace op
++}  // namespace ggml
++}  // namespace frontend
++}  // namespace ov
+diff --git a/src/ggml-openvino/openvino/op/pool_2d.cpp b/src/ggml-openvino/openvino/op/pool_2d.cpp
+new file mode 100644
+index 0000000..31df1cc
+--- /dev/null
++++ b/src/ggml-openvino/openvino/op/pool_2d.cpp
+@@ -0,0 +1,64 @@
++#include "../node_context.h"
++#include "../op_table.h"
++#include "../utils.h"
++#include "ggml.h"
++
++#include <memory>
++#include <openvino/op/avg_pool.hpp>
++#include <openvino/op/max_pool.hpp>
++
++namespace ov {
++namespace frontend {
++namespace ggml {
++namespace op {
++
++// GGML_OP_POOL_2D (ggml_pool_2d): op_params = {op, k0, k1, s0, s1, p0, p1},
++// all stored as int32 -- ggml_pool_2d's own array initializer truncates the
++// float p0/p1 parameters to int, so integer padding is what the graph
++// actually carries; CrispEmbed's PP-OCRv6/RT-DETRv2 callers only ever pass
++// integer padding anyway. Cross-checked against ggml-cpu's own reference
++// (ggml-cpu/ops.cpp ggml_compute_forward_pool_2d):
++//   - AVG always divides by k0*k1 regardless of how many taps were
++//     in-bounds -- that's OV's exclude_pad=false, not the "true spatial
++//     average over valid taps" some frameworks default to.
++//   - output size is ggml's own floor division
++//     ((ins + 2*p - ks) / s + 1) -- matched via rounding_type=FLOOR.
++OutputVector translate_pool_2d(const NodeContext & context) {
++    num_inputs_check(context, 1, 1);
++
++    const int32_t * params = context.get_output_op_params();
++    FRONT_END_CHECK_IMPLEMENTED(params != nullptr, "POOL_2D requires output op params");
++    const int32_t pool_op = params[0];
++    const int32_t k0 = params[1];
++    const int32_t k1 = params[2];
++    const int32_t s0 = params[3];
++    const int32_t s1 = params[4];
++    const int32_t p0 = params[5];
++    const int32_t p1 = params[6];
++
++    auto input = context.get_input(0);
++
++    const ov::Shape kernel{static_cast<size_t>(k1), static_cast<size_t>(k0)};
++    const ov::Strides strides{static_cast<size_t>(s1), static_cast<size_t>(s0)};
++    const ov::Shape pads_begin{static_cast<size_t>(p1), static_cast<size_t>(p0)};
++    const ov::Shape pads_end{static_cast<size_t>(p1), static_cast<size_t>(p0)};
++
++    ov::Output<ov::Node> res;
++    if (pool_op == GGML_OP_POOL_MAX) {
++        res = std::make_shared<ov::op::v1::MaxPool>(
++            input, strides, pads_begin, pads_end, kernel, ov::op::RoundingType::FLOOR, ov::op::PadType::EXPLICIT);
++    } else if (pool_op == GGML_OP_POOL_AVG) {
++        res = std::make_shared<ov::op::v1::AvgPool>(
++            input, strides, pads_begin, pads_end, kernel, /*exclude_pad=*/false, ov::op::RoundingType::FLOOR,
++            ov::op::PadType::EXPLICIT);
++    } else {
++        FRONT_END_CHECK_IMPLEMENTED(false, "POOL_2D: unsupported ggml_op_pool value");
++    }
++
++    return rename_outputs_with_suffix({res}, context.get_name());
++}
++
++}  // namespace op
++}  // namespace ggml
++}  // namespace frontend
++}  // namespace ov
+diff --git a/src/ggml-openvino/openvino/op/upscale.cpp b/src/ggml-openvino/openvino/op/upscale.cpp
+new file mode 100644
+index 0000000..a25bace
+--- /dev/null
++++ b/src/ggml-openvino/openvino/op/upscale.cpp
+@@ -0,0 +1,82 @@
++#include "../node_context.h"
++#include "../op_table.h"
++#include "../utils.h"
++#include "ggml.h"
++
++#include <memory>
++#include <openvino/op/constant.hpp>
++#include <openvino/op/interpolate.hpp>
++#include <vector>
++
++namespace ov {
++namespace frontend {
++namespace ggml {
++namespace op {
++
++// GGML_OP_UPSCALE (ggml_upscale / ggml_upscale_ext / ggml_interpolate):
++// op_params[0] packs the scale mode in the low byte plus GGML_SCALE_FLAG_*
++// in bit 8 (ALIGN_CORNERS) / bit 9 (ANTIALIAS). Only the combination
++// CrispEmbed's OCR/layout models actually call today -- plain NEAREST, no
++// align_corners/antialias, used by every ggml_interpolate/ggml_upscale call
++// site in src/ppocrv6_det.cpp and src/layout_detect.cpp -- is implemented,
++// cross-checked against ggml-cpu's ggml_compute_forward_upscale_f32: NEAREST
++// does floor(i / scale) with no pixel-center offset (OV: coordinate
++// transform ASYMMETRIC + nearest_mode FLOOR). Plain BILINEAR (no
++// align_corners/antialias) is also wired since it's a one-line addition and
++// unambiguous (ggml's 0.5-offset, clamped-neighbour formula matches OV's
++// HALF_PIXEL exactly) but is UNEXERCISED by any call site as of this
++// change. BICUBIC and the antialiased-BILINEAR path are deliberately left
++// unimplemented (explicit translation-time failure) rather than guessed,
++// since neither ggml-cpu's antialias filter nor its bicubic kernel has an
++// obviously-equivalent single OV Interpolate configuration.
++OutputVector translate_upscale(const NodeContext & context) {
++    num_inputs_check(context, 1, 1);
++
++    const int32_t * params = context.get_output_op_params();
++    FRONT_END_CHECK_IMPLEMENTED(params != nullptr, "UPSCALE requires output op params");
++    const int32_t mode_flags   = params[0];
++    const int32_t mode         = mode_flags & 0xFF;
++    const bool    align_corners = (mode_flags & GGML_SCALE_FLAG_ALIGN_CORNERS) != 0;
++    const bool    antialias     = (mode_flags & GGML_SCALE_FLAG_ANTIALIAS) != 0;
++
++    FRONT_END_CHECK_IMPLEMENTED(!antialias, "UPSCALE: antialias is not implemented");
++    FRONT_END_CHECK_IMPLEMENTED(mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR,
++                                "UPSCALE: only NEAREST and BILINEAR are implemented");
++    FRONT_END_CHECK_IMPLEMENTED(!(align_corners && mode == GGML_SCALE_MODE_NEAREST),
++                                "UPSCALE: align_corners with NEAREST is not implemented "
++                                "(ggml's own NEAREST path ignores the flag too)");
++
++    auto input = context.get_input(0);
++    const auto out_shape = context.get_output_shape().to_shape();  // [N, C, OH, OW]
++    FRONT_END_CHECK_IMPLEMENTED(out_shape.size() == 4, "UPSCALE: expected a 4D output shape");
++
++    auto sizes = ov::op::v0::Constant::create(
++        ov::element::i64, ov::Shape{2},
++        std::vector<int64_t>{static_cast<int64_t>(out_shape[2]), static_cast<int64_t>(out_shape[3])});
++    auto axes = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, std::vector<int64_t>{2, 3});
++
++    ov::op::v11::Interpolate::InterpolateAttrs attrs;
++    attrs.shape_calculation_mode = ov::op::v11::Interpolate::ShapeCalcMode::SIZES;
++    attrs.nearest_mode           = ov::op::v11::Interpolate::NearestMode::FLOOR;
++    attrs.pads_begin             = {0, 0};
++    attrs.pads_end               = {0, 0};
++
++    if (mode == GGML_SCALE_MODE_NEAREST) {
++        attrs.mode                          = ov::op::v11::Interpolate::InterpolateMode::NEAREST;
++        attrs.coordinate_transformation_mode = ov::op::v11::Interpolate::CoordinateTransformMode::ASYMMETRIC;
++    } else {
++        attrs.mode                          = ov::op::v11::Interpolate::InterpolateMode::LINEAR_ONNX;
++        attrs.coordinate_transformation_mode = align_corners
++            ? ov::op::v11::Interpolate::CoordinateTransformMode::ALIGN_CORNERS
++            : ov::op::v11::Interpolate::CoordinateTransformMode::HALF_PIXEL;
++    }
++
++    ov::Output<ov::Node> res = std::make_shared<ov::op::v11::Interpolate>(input, sizes, axes, attrs);
++
++    return rename_outputs_with_suffix({res}, context.get_name());
++}
++
++}  // namespace op
++}  // namespace ggml
++}  // namespace frontend
++}  // namespace ov
+diff --git a/src/ggml-openvino/openvino/op_table.cpp b/src/ggml-openvino/openvino/op_table.cpp
+index 59fd26d..832a661 100644
+--- a/src/ggml-openvino/openvino/op_table.cpp
++++ b/src/ggml-openvino/openvino/op_table.cpp
+@@ -23,6 +23,10 @@ std::unordered_map<std::string, CreatorFunction> get_supported_ops() {
+         {"GGML_OP_ADD_ID",          op::translate_add_id                           },
+         {"GGML_OP_CONCAT",          op::translate_concat                           },
+         {"GGML_OP_CONT",            op::translate_cont                             },
++        {"GGML_OP_CONV_2D",         op::translate_conv_2d                          },
++        {"GGML_OP_CONV_2D_DW",      op::translate_conv_2d_dw                       },
++        {"GGML_OP_POOL_2D",         op::translate_pool_2d                          },
++        {"GGML_OP_UPSCALE",         op::translate_upscale                          },
+         {"GGML_OP_DIV",             op::translate_div                              },
+         {"GGML_OP_GET_ROWS",        op::translate_get_rows                         },
+         {"GGML_OP_IM2COL",          op::translate_im2col                           },
+diff --git a/src/ggml-openvino/openvino/op_table.h b/src/ggml-openvino/openvino/op_table.h
+index 1d695fa..47f0a3a 100644
+--- a/src/ggml-openvino/openvino/op_table.h
++++ b/src/ggml-openvino/openvino/op_table.h
+@@ -12,6 +12,10 @@ namespace op {
+ 
+ GGML_OP_CONVERTER(translate_cont);
+ GGML_OP_CONVERTER(translate_concat);
++GGML_OP_CONVERTER(translate_conv_2d);
++GGML_OP_CONVERTER(translate_conv_2d_dw);
++GGML_OP_CONVERTER(translate_pool_2d);
++GGML_OP_CONVERTER(translate_upscale);
+ GGML_OP_CONVERTER(translate_add_id);
+ GGML_OP_CONVERTER(translate_div);
+ GGML_OP_CONVERTER(translate_get_rows);

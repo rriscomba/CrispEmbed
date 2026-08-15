@@ -6,12 +6,25 @@ GPU-ready via ggml backends (CUDA/Metal/Vulkan), no Python at runtime.
 
 ## OPEN TASKS — OpenVINO backend (opened 2026-08-15, requested: make OpenVINO the default backend, piloted on PP-OCRv6 detector + RT-DETRv2 layout)
 
-**Status: build wiring landed and gated OFF by default (`GGML_OPENVINO`, mirrors
-GGML_CUDA/VULKAN/METAL). Op-coverage is CONFIRMED insufficient for the requested
-pilot models — do not flip any default before the gaps below are closed and
-A/B'd. This is a measured finding, not a guess: verified by actually building
-`ggml-openvino` against a real OpenVINO 2026.3.0 runtime + OpenCL dev headers in
-this session.**
+**Status (updated same day, round 2): build wiring landed, gated OFF by default
+(`GGML_OPENVINO`, mirrors GGML_CUDA/VULKAN/METAL). All ops the two pilot models
+call now have OpenVINO translators and the backend builds clean against a real
+OpenVINO runtime. NONE OF IT IS NUMERICALLY VALIDATED — no decoded-output
+roundtrip has been run, because this sandbox cannot reach huggingface.co (org
+egress policy denies it, confirmed via the proxy status endpoint) to download
+the PP-OCRv6/RT-DETRv2 GGUF files, and has no OpenVINO-capable inference
+device beyond the CPU plugin anyway. Per CLAUDE.md's hard rule, that roundtrip
+— not "it compiles" — is the only real acceptance test. Do not flip any
+default, and do not trust these 4 new translators' numerics, until that run
+happens on a box with HF access.**
+
+A real test image was provided this round (a COFIDE "Uso de Movilidad Local"
+expense form, phone-screenshot of a PDF) — kept local to whatever box runs the
+actual A/B, NOT committed to this repo (it carries a named person's DNI and
+another person's digital-signature details; treat it as PII, don't push it
+anywhere). It's a reasonable layout-detection fixture (form with boxes/labels/
+checkboxes) but was never run through anything here because of the HF block
+above.
 
 ### What's in the `ggml` submodule already
 
@@ -72,41 +85,83 @@ is handed to the OpenVINO backend, not a wrong-but-plausible output. That is
 actually the good failure mode: it can't silently corrupt OCR/layout output,
 it just won't run yet.
 
-### Why this session stopped here instead of writing those 4 translators
+### Round 2 (same day): wrote the 4 missing translators, unvalidated
 
-CLAUDE.md's hard rule: **decoded-output roundtrip against ground truth is the
-only acceptance test**, and new op translators need exactly that before they
-can be trusted — conv/pool/upscale involve stride/padding/dilation and
-NCHW-vs-ggml-layout mapping, which is real op-authoring work with a wrong-answer
-failure mode (unlike RELU/SIGMOID, a mistranslated padding mode won't throw,
-it'll produce a plausible-looking wrong region grid or wrong glyph boxes).
-This sandbox has no OpenVINO-capable device to actually run inference on, no
-PP-OCRv6/RT-DETRv2 GGUF + test image fixture wired up here, and no comparator
-run yet — so writing those 4 translators now would mean shipping unverified
-numeric code on the riskiest op class in the whole set. Not done here.
+User made an explicit, informed call to proceed without the roundtrip test
+(sandbox genuinely cannot reach HF; see status above) rather than pause.
+Wrote `GGML_OP_CONV_2D`, `GGML_OP_CONV_2D_DW`, `GGML_OP_POOL_2D`,
+`GGML_OP_UPSCALE` translators, new files under
+`ggml/src/ggml-openvino/openvino/op/{conv_2d,conv_2d_dw,pool_2d,upscale}.cpp`,
+registered in `op_table.h`/`op_table.cpp`. Captured as
+`patches/ggml-openvino-conv-pool-upscale-ops.patch` (targets the `ggml` fork
+repo, which this session has no push access to) — supersedes the earlier
+`ggml-openvino-unary-ops.patch`, which is now folded into this one. Compiles
+and links clean against the same real OpenVINO 2026.3.0 runtime used in round 1.
+
+Grounding for each translator (not guessed — derived from ggml's own C source,
+since that's the only ground truth available without a running device):
+
+- **CONV_2D / CONV_2D_DW**: `im2col.cpp`'s own comment documents "OV shape =
+  reverse(ggml ne)" for these image tensors. Reversing ggml's `[KW,KH,IC,OC]`
+  kernel / `[W,H,IC,N]` image ne gives exactly OpenVINO's native
+  `Convolution`/`GroupConvolution` layout (`[N,C,H,W]` data,
+  `[C_out,C_in,KH,KW]` filters) with **zero permutation needed**, and the
+  resulting `[N,OC,OH,OW]` reversed matches `ggml_conv_2d_direct`'s own
+  declared output `ne=[OW,OH,OC,N]` exactly. Depthwise reshapes the kernel
+  from `[C,1,KH,KW]` to GroupConvolution's required `[C,1,1,KH,KW]` (pure
+  reshape, no data movement — `a->ne[2]==1` is asserted at graph-construction
+  time in `ggml_conv_2d_dw_direct`). This is a direct 1:1 structural mapping,
+  not a hand-rederived im2col decomposition, so it's the more-trustworthy half
+  of this round's work — but "more trustworthy" is not "validated."
+- **POOL_2D**: cross-checked against `ggml-cpu/ops.cpp`
+  `ggml_compute_forward_pool_2d` line by line. Two non-obvious findings baked
+  into the translator: AVG always divides by `k0*k1` regardless of in-bounds
+  taps (→ OV `exclude_pad=false`, NOT the "true average over valid taps" some
+  frameworks default to — get this backwards and every AVG pool near an edge
+  is silently wrong), and ggml's op_params array init truncates the `float
+  p0/p1` padding args to `int32_t` (checked: none of PP-OCRv6/RT-DETRv2's call
+  sites in this repo pass non-integer padding, so this is fine here but would
+  silently misbehave for a caller that didn't).
+- **UPSCALE**: cross-checked against `ggml_compute_forward_upscale_f32`.
+  Every actual call site in `src/ppocrv6_det.cpp` and `src/layout_detect.cpp`
+  uses plain `GGML_SCALE_MODE_NEAREST` (no align_corners, no antialias) — that
+  path is implemented (OV `ASYMMETRIC` + `FLOOR`, matching ggml's
+  offset-free `floor(i/scale)`). Plain BILINEAR is also wired (ggml's 0.5-
+  pixel-offset formula matches OV `HALF_PIXEL` exactly) but is untested by any
+  call site. BICUBIC and antialiased-BILINEAR are left as an **explicit
+  translation-time failure** rather than guessed — the right failure mode per
+  the hard rule (a thrown exception can't corrupt output; a wrong guess can).
+
+None of this has run against real data. The axis-order reasoning is grounded
+in an existing, presumably-tested comment in this same codebase (`im2col.cpp`)
+plus ggml's own C reference implementations, which is the most rigor possible
+without a device — but it is still unverified engineering judgment, not a
+measurement. Treat every one of these 4 translators as suspect until the A/B
+below actually runs.
 
 ### Next actions (in order)
 
-1. Get this branch onto a box with a real OpenVINO-capable device (Intel
-   CPU is enough — OpenVINO's CPU plugin doesn't need iGPU/NPU) and the
-   existing page-comparator/benchmark tooling (`crispasr-crispembed-dev.md`
-   mandates the diff harness at every boundary).
-2. Write `GGML_OP_CONV_2D` and `GGML_OP_CONV_2D_DW` translators in
-   `ggml/src/ggml-openvino/openvino/op/` (new files, following the existing
-   op/ dir pattern — see `im2col.cpp` for the closest existing analogue),
-   mapping ggml's `[KW,KH,IC,OC]`/`[W,H,C,N]` layout + `op_params`
-   (stride/pad/dilation) to `ov::op::v1::Convolution` /
-   `ov::op::v1::GroupConvolution` attributes.
-3. Same for `GGML_OP_POOL_2D` (→ `ov::op::v1::{Avg,Max}Pool`, ggml's pool op
-   carries op type + kernel/stride/pad in `op_params`) and `GGML_OP_UPSCALE`
-   (→ `ov::op::v11::Interpolate`, check ggml's upscale mode — nearest vs
-   bilinear — against Interpolate's mode enum).
-4. Run PP-OCRv6 detector and RT-DETRv2 layout through the comparator with
-   `--gpu-backend openvino` vs the existing CPU/CUDA/Vulkan/Metal path on the
-   canonical page fixture(s): actual text/region/line counts, CER/WER,
-   confidence, timing — not pass/fail. Record the result here and in
-   `PERFORMANCE.md` even if it's worse or fails.
-5. Only after that A/B is measured and recorded does "OpenVINO as default"
+1. Get this branch onto a box with HF access (to pull the PP-OCRv6/RT-DETRv2
+   GGUF files) and a real OpenVINO-capable device (Intel CPU is enough —
+   OpenVINO's CPU plugin doesn't need iGPU/NPU) plus the existing
+   page-comparator/benchmark tooling (`crispasr-crispembed-dev.md` mandates
+   the diff harness at every boundary). Apply
+   `patches/ggml-openvino-conv-pool-upscale-ops.patch` on top of the `ggml`
+   submodule (or get it merged into `CrispStrobe/ggml` first).
+2. Run PP-OCRv6 detector and RT-DETRv2 layout through `--gpu-backend
+   openvino` on the COFIDE test-form image (and the existing canonical page
+   fixtures) and diff region boxes / detection scores against the CPU/
+   default-backend baseline. Expect the translation to at least *succeed*
+   now (all called ops have translators); whether the *numbers* match is the
+   open question this whole round couldn't answer.
+3. If CONV_2D/CONV_2D_DW/POOL_2D/UPSCALE numbers diverge from baseline,
+   suspect axis order first (easiest class of bug to get subtly wrong here),
+   then the AVG-pool exclude_pad assumption, then the UPSCALE
+   coordinate-transform choice — in that order, since that's the order of
+   "how much of this round's reasoning was inference vs. read-off-the-source."
+   Record actual region/box counts, IoU vs baseline, confidence, timing —
+   not pass/fail — here and in `PERFORMANCE.md`, even if it's worse or fails.
+4. Only after that A/B is measured and recorded does "OpenVINO as default"
    become a defensible next question — and even then, CUDA/Vulkan/Metal stay
    as working, non-deleted fallback paths per the hard rule.
 
