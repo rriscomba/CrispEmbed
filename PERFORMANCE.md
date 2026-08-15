@@ -48,11 +48,32 @@ Fit: OpenVINO ~19.5 ms fixed + ~2.1 ms/layer; ggml CPU ~7.4 ms/layer, i.e. the
 convolution itself is ~3.4x faster and the fixed cost amortises from ~4 layers.
 Practical rule: route whole-network graphs to OpenVINO, never single-op lanes.
 
-**Caveat, not yet resolved:** graphs deeper than 17 conv layers fail to compile
-(`Doesn't support dynamic weights shape`); verified OK at 17, failing from 20.
-Cause is the upstream decoder marking graph inputs dynamic once the model is
-split, not the op translators. Real OCR/layout backbones are deeper than this,
-so no whole-model number can be quoted yet. See PLAN.md.
+**Depth limit resolved (same day).** The earlier ">17 conv layers fails to
+compile" caveat is fixed: `is_kvcache()` was classifying convolution kernels as
+KV cache (it tested only `buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY`, which
+is the default usage and so matches every tensor in a CNN graph), which forced
+their weights dynamic. Graphs under 20 ops were unaffected only because
+`is_naive()` routes them around that path entirely. Post-fix:
+
+| conv layers in one graph | CPU | OpenVINO | speedup |
+|---|---|---|---|
+| 17 | 122 ms | 47 ms | 2.58x |
+| 20 | 146 ms | 52 ms | 2.82x |
+| 32 | 278 ms | 71 ms | 3.93x |
+| 48 | 416 ms | 91 ms | 4.59x |
+| 64 | 560 ms | 115 ms | 4.88x |
+
+The advantage keeps growing with depth as the fixed conversion cost amortises,
+so a real backbone should do better than 4.88x on this box. A mixed
+detector-shaped stack (conv/relu/pool/upscale/sigmoid, `bench_openvino_cnn_stack.cpp`)
+at 10/26/50 ops matches the CPU backend elementwise (max|diff| <= 5.96e-08).
+
+Still outstanding: a whole-model number, which needs the GGUF weights.
+
+Note for whoever measures next: `naive_compute()` (graphs under 20 ops) has no
+model cache and recompiles every call, so small graphs pay a full OpenVINO
+compile per inference. That is the ~20 ms floor visible in the single-op table
+above.
 
 ## Issue #45 follow-up: the "0 = auto" n_threads contract implemented API-wide; server default fixed (M1, 2026-08-09)
 

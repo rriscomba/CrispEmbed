@@ -1,3 +1,56 @@
+diff --git a/src/ggml-openvino/ggml-decoder.h b/src/ggml-openvino/ggml-decoder.h
+index ae545f4..21f7b07 100644
+--- a/src/ggml-openvino/ggml-decoder.h
++++ b/src/ggml-openvino/ggml-decoder.h
+@@ -287,7 +287,48 @@ public:
+         return op->op == GGML_OP_ROPE && tensor == op->src[2];
+     }
+ 
++    // A tensor feeding one of these can never be a KV cache: they are the
++    // convolution/pooling/resampling stages of a CNN. See is_kvcache().
++    inline static bool is_conv_like_op(const ggml_tensor * op) {
++        if (op == nullptr) {
++            return false;
++        }
++        switch (op->op) {
++        case GGML_OP_CONV_2D:
++        case GGML_OP_CONV_2D_DW:
++        case GGML_OP_POOL_2D:
++        case GGML_OP_UPSCALE:
++            return true;
++        default:
++            return false;
++        }
++    }
++
+     inline static bool is_kvcache(const ggml_tensor * tensor, const ggml_tensor * op) {
++        // GGML_BACKEND_BUFFER_USAGE_ANY is the DEFAULT buffer usage, not a
++        // KV-cache marker. It singles out the KV cache in a llama.cpp model only
++        // because there the weights sit in a USAGE_WEIGHTS buffer. Any graph
++        // that does not partition its tensors that way -- a CNN detector, a
++        // vision encoder, anything allocated through
++        // ggml_backend_alloc_ctx_tensors -- has usage ANY on EVERY tensor, so
++        // this test classified convolution kernels as KV cache and
++        // get_graph_input_shape() then forced their OV dim 2 dynamic. OpenVINO
++        // cannot compile a Convolution with dynamic weights at all, so a CNN
++        // graph big enough to miss the is_naive() fast path (>= 20 ops, see
++        // is_naive() in utils.cpp) failed outright. Measured: a conv chain ran
++        // at 17 layers and died from 20.
++        //
++        // The exclusion is keyed on the CONSUMING OP rather than on the
++        // tensor's shape deliberately. A shape-based rule (real KV caches being
++        // [.., .., 1, 1]) would also have worked for llama.cpp, but CrispEmbed's
++        // own VLM decoders allocate 3-D/4-D KV caches -- see qwen2vl_ocr.cpp and
++        // got_ocr.cpp -- and would have been reclassified by it, with no way to
++        // test that here. Keying on conv-like ops instead means the only graphs
++        // whose behaviour changes are ones that previously could not run at all,
++        // so this cannot regress a working path.
++        if (is_conv_like_op(op)) {
++            return false;
++        }
+         return tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY ||
+                (op != nullptr && op->op == GGML_OP_SET_ROWS && op->src[2] == tensor);
+     }
 diff --git a/src/ggml-openvino/ggml-openvino.cpp b/src/ggml-openvino/ggml-openvino.cpp
 index 659dbd4..63b8a74 100644
 --- a/src/ggml-openvino/ggml-openvino.cpp
@@ -484,10 +537,19 @@ index 0000000..04901a3
 +}  // namespace frontend
 +}  // namespace ov
 diff --git a/src/ggml-openvino/openvino/op_table.cpp b/src/ggml-openvino/openvino/op_table.cpp
-index 59fd26d..832a661 100644
+index 59fd26d..0bf8189 100644
 --- a/src/ggml-openvino/openvino/op_table.cpp
 +++ b/src/ggml-openvino/openvino/op_table.cpp
-@@ -23,6 +23,10 @@ std::unordered_map<std::string, CreatorFunction> get_supported_ops() {
+@@ -8,6 +8,8 @@
+ #include <openvino/op/gelu.hpp>
+ #include <openvino/op/matmul.hpp>
+ #include <openvino/op/multiply.hpp>
++#include <openvino/op/relu.hpp>
++#include <openvino/op/sigmoid.hpp>
+ #include <openvino/op/subtract.hpp>
+ #include <openvino/op/tanh.hpp>
+ 
+@@ -23,6 +25,10 @@ std::unordered_map<std::string, CreatorFunction> get_supported_ops() {
          {"GGML_OP_ADD_ID",          op::translate_add_id                           },
          {"GGML_OP_CONCAT",          op::translate_concat                           },
          {"GGML_OP_CONT",            op::translate_cont                             },
@@ -498,6 +560,15 @@ index 59fd26d..832a661 100644
          {"GGML_OP_DIV",             op::translate_div                              },
          {"GGML_OP_GET_ROWS",        op::translate_get_rows                         },
          {"GGML_OP_IM2COL",          op::translate_im2col                           },
+@@ -45,6 +51,8 @@ std::unordered_map<std::string, CreatorFunction> get_supported_ops() {
+         {"GGML_UNARY_OP_SILU",      op::translate_unary_silu                       },
+         {"GGML_UNARY_OP_SOFTPLUS",  op::translate_unary_softplus                   },
+         {"GGML_UNARY_OP_TANH",      op::translate_1to1_match_1_input<v0::Tanh>     },
++        {"GGML_UNARY_OP_RELU",      op::translate_1to1_match_1_input<v0::Relu>     },
++        {"GGML_UNARY_OP_SIGMOID",   op::translate_1to1_match_1_input<v0::Sigmoid>  },
+         {"GGML_OP_VIEW",            op::translate_view                             },
+         {"GGML_GLU_OP_SWIGLU",      op::translate_glu_swiglu                       },
+         {"GGML_GLU_OP_SWIGLU_OAI",  op::translate_glu_swiglu_oai                   },
 diff --git a/src/ggml-openvino/openvino/op_table.h b/src/ggml-openvino/openvino/op_table.h
 index 1d695fa..47f0a3a 100644
 --- a/src/ggml-openvino/openvino/op_table.h

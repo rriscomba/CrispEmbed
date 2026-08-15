@@ -47,7 +47,7 @@ int main(){
         if(std::string(ggml_backend_dev_name(d)).rfind("OPENVINO",0)==0){ ov=ggml_backend_dev_init(d,nullptr); break; } }
     if(!ov){printf("no ov\n");return 1;}
     printf("%-8s %12s %12s %10s\n","depth","CPU ms","OpenVINO ms","speedup");
-    for (int d : {1,2,4,8,16,17,20,24,32}) {
+    for (int d : {1,2,4,8,16,17,20,24,32,48,64}) {
         bool a=false,b2=false;
         double tc=run(cpu,d,5,a), to=run(ov,d,5,b2);
         printf("%-8d %12.2f %12.2f %9.2fx\n", d, tc, to, tc/to);
